@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""liveclip: Goated AI Live & VOD Clipper (Audio Loudness + Groq Multi-Key 6k TPM + Side-by-Side GPU Render)."""
+"""liveclip: Goated AI Live, VOD & Local File Clipper (Audio Loudness + Groq Multi-Key 6k TPM + GPU Render)."""
 import argparse, csv, json, os, queue, re, shutil, signal, statistics, subprocess, sys, threading, time, urllib.error, urllib.request
 from collections import Counter, deque
 
-ap = argparse.ArgumentParser(description="AI-powered live stream & VOD vertical clipper.")
-ap.add_argument("url", help="YouTube or Twitch link (live stream or finished VOD)")
+ap = argparse.ArgumentParser(description="AI-powered live stream, VOD, and local video vertical clipper.")
+ap.add_argument("url", help="YouTube/Twitch URL or local video file path (e.g. /content/drive/MyDrive/vod.mp4)")
 ap.add_argument("--out", default="clips", help="output folder (default: clips)")
 ap.add_argument("--quality", default="720p,720p60,480p,best", help="streamlink quality list")
 ap.add_argument("--pre", type=float, default=24, help="seconds before the highlight spike")
@@ -23,6 +23,7 @@ ap.add_argument("--face", choices=["auto", "top-left", "top-right", "bottom-left
 ap.add_argument("--face-pct", type=float, default=35)
 ap.add_argument("--mode", choices=["auto", "live", "recorded"], default="auto")
 ap.add_argument("--font", default="", help="path to a .ttf font for captions")
+ap.add_argument("--cookies", default="", help="path to cookies.txt for YouTube bot-check bypass")
 ap.add_argument("--groq-keys", default="", help="comma-separated Groq API keys for multi-key 6k TPM rotation")
 ap.add_argument("--groq-model", default="llama-3.3-70b-versatile", help="Groq LLM model ID")
 ap.add_argument("--keep", action="store_true", help="keep raw recording segments")
@@ -129,7 +130,6 @@ class GroqPool:
             time.sleep(sleep_s)
 
     def analyze_chunk(self, chunk_text, clip_len, max_picks=3):
-        """Sends one ~4.8k-token transcript chunk to Groq and returns viral clip dicts."""
         sys_prompt = (
             "You are an elite viral short-form video editor (YouTube Shorts / Reels). "
             "Given a timestamped stream transcript ([seconds] text), pick the funniest, most intense, "
@@ -253,15 +253,6 @@ def per_second(now, span):
         if k >= 0:
             c[int(span) - 1 - k] += 1
     return c
-
-
-def top_words(t0, t1, n=4):
-    words = Counter()
-    for t, msg in chat_times:
-        if t0 <= t <= t1:
-            for w in set(re.findall(r"[\w']{2,}", msg.lower())):
-                words[w] += 1
-    return " ".join(w for w, _ in words.most_common(n))
 
 
 # ------------------------------------------------------------------ 2. Whisper + Viral .ASS Captions
@@ -526,11 +517,13 @@ def render(raw, ss, dur, name, tmp):
     return out
 
 
-# ------------------------------------------------------------------ 4. Recorded VOD (Audio Loudness + Groq AI + Side-by-Side Render)
+# ------------------------------------------------------------------ 4. Recorded VOD & Local File (Hybrid Audio + Groq AI)
 YTDLP = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-playlist"]
+if a.cookies and os.path.exists(a.cookies):
+    YTDLP += ["--cookies", a.cookies]
 CLIENTS = [[], *[["--extractor-args", f"youtube:player_client={c}"] for c in ("tv_simply", "tv", "web_safari", "mweb", "android_vr")]]
 CLIENT = []
-BLOCKED = "YouTube is blocking this cloud IP right now. Try a Twitch link or retry in a few hours."
+BLOCKED = "YouTube is blocking this cloud IP. Use a local Drive video file or add cookies.txt to My Drive/liveclip/."
 
 
 def is_bot_block(err):
@@ -572,7 +565,6 @@ def is_live(url):
 
 
 def audio_db_curve(wav_16k):
-    """Returns per-second dB above median loudness."""
     import numpy as np
     x = load_wav(wav_16k)
     sec = len(x) // 16000
@@ -584,7 +576,6 @@ def audio_db_curve(wav_16k):
 
 
 def chunk_transcript(lines, max_input_tokens=4800):
-    """Packs '[sec] text' lines into ~4.8k-token chunks so total (in+out) stays under 6k TPM."""
     chunks, cur, cur_tok = [], [], 0
     for ln in lines:
         tok = len(ln) // 4 + 2
@@ -600,6 +591,7 @@ def chunk_transcript(lines, max_input_tokens=4800):
 
 def recorded():
     import numpy as np
+    is_local = os.path.isfile(a.url)
     max_clips = a.max_clips or 5
     length = a.pre + a.post
     work = os.path.join(REC, "vod")
@@ -610,23 +602,29 @@ def recorded():
     if not keys:
         sys.exit("❌ Pass at least one Groq API key via --groq-keys.")
 
-    say(f"🚀 VOD Hybrid AI Mode: Audio Loudness + {len(keys)} Groq key(s) (6k TPM/key) + Side-by-Side GPU Render")
-    audio = os.path.join(work, "audio.%(ext)s")
-    with step("downloading VOD audio"):
-        ytdlp(["-f", "ba/b[height<=480]/b", "-o", audio, a.url], "audio")
-    got = [f for f in os.listdir(work) if f.startswith("audio.")]
-    if not got:
-        sys.exit("Couldn't download VOD audio.")
-    wav = os.path.join(work, "all_16k.wav")
-    with step("converting audio to 16kHz WAV"):
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(work, got[0]),
-                        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
+    src_label = f"Local File ({os.path.basename(a.url)})" if is_local else "Remote VOD"
+    say(f"🚀 {src_label} | Hybrid Audio Loudness + {len(keys)} Groq key(s) (6k TPM/key) + Side-by-Side GPU Render")
 
-    with step("analyzing audio loudness & transcribing VOD on GPU"):
+    wav = os.path.join(work, "all_16k.wav")
+    if is_local:
+        with step("extracting 16kHz audio from local video"):
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", a.url,
+                            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
+    else:
+        audio = os.path.join(work, "audio.%(ext)s")
+        with step("downloading VOD audio"):
+            ytdlp(["-f", "ba/b[height<=480]/b", "-o", audio, a.url], "audio")
+        got = [f for f in os.listdir(work) if f.startswith("audio.")]
+        if not got:
+            sys.exit("Couldn't download VOD audio.")
+        with step("converting audio to 16kHz WAV"):
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(work, got[0]),
+                            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
+
+    with step("analyzing audio loudness & transcribing on GPU"):
         db_curve = audio_db_curve(wav)
         segs, _ = whisper().transcribe(load_wav(wav), vad_filter=True, beam_size=1, condition_on_previous_text=False)
-        lines = []
-        covered_secs = set()
+        lines, covered_secs = [], set()
         for s in segs:
             txt = s.text.strip()
             if not txt:
@@ -637,7 +635,6 @@ def recorded():
             lines.append(f"[{int(s.start)}s] {tag}{txt}")
             covered_secs.update(range(i0, i1))
 
-        # Catch pure non-verbal screams / hype bursts skipped by Whisper VAD
         loud_peaks = [i for i in range(len(db_curve)) if db_curve[i] >= 12.0 and i not in covered_secs]
         last_p = -999
         for p in loud_peaks:
@@ -649,7 +646,6 @@ def recorded():
     chunks = chunk_transcript(lines, max_input_tokens=4800)
     say(f"📝 Hybrid transcript ready: {len(lines)} lines -> {len(chunks)} Groq chunk(s) (~4.8k tokens each)")
 
-    # Side-by-Side Pipeline: GPU Render Worker runs while Groq analyzes remaining chunks
     clip_q = queue.Queue()
     made_count = [0]
     seen_starts = []
@@ -668,13 +664,16 @@ def recorded():
             name = f"clip_{int(t0 // 60)}m{int(t0 % 60):02d}s_{safe_title}"
             tmp = os.path.join(work, name)
             os.makedirs(tmp, exist_ok=True)
-            raw = os.path.join(tmp, "raw.mp4")
             say(f"🎬 [Worker] Rendering '{title}' ({int(t0 // 60)}:{int(t0 % 60):02d}, score {score}/10)…")
             try:
-                ytdlp(["-f", "bv*[height<=720]+ba/b[height<=720]/b", "--merge-output-format", "mp4",
-                       "--download-sections", f"*{t0:.0f}-{t0 + dur:.0f}", "--force-keyframes-at-cuts",
-                       "-o", raw, a.url], "clip")
-                path = render(raw, 0, dur, name, tmp)
+                if is_local:
+                    path = render(a.url, t0, dur, name, tmp)
+                else:
+                    raw = os.path.join(tmp, "raw.mp4")
+                    ytdlp(["-f", "bv*[height<=720]+ba/b[height<=720]/b", "--merge-output-format", "mp4",
+                           "--download-sections", f"*{t0:.0f}-{t0 + dur:.0f}", "--force-keyframes-at-cuts",
+                           "-o", raw, a.url], "clip")
+                    path = render(raw, 0, dur, name, tmp)
                 made_count[0] += 1
                 say("saved", path)
             except Exception as e:
@@ -781,7 +780,10 @@ def main():
 
 
 if __name__ == "__main__":
-    mode = a.mode
-    if mode == "auto":
-        mode = "live" if is_live(a.url) else "recorded"
-    recorded() if mode == "recorded" else main()
+    if os.path.isfile(a.url):
+        recorded()
+    else:
+        mode = a.mode
+        if mode == "auto":
+            mode = "live" if is_live(a.url) else "recorded"
+        recorded() if mode == "recorded" else main()
