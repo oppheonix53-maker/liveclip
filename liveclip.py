@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""liveclip: AI-powered live stream & VOD clipper optimized for GPU (Colab T4).
-
-  python liveclip.py <youtube-or-twitch-url> [options]
-
-- Live streams: records 6s .ts segments (zero re-encode) and clips on chat spikes.
-- Recorded VODs: transcribes audio on GPU and uses AI emotion/hype + audio energy to find the best moments.
-- Captions: word-level viral .ass karaoke captions (active word highlight + pop animation).
-- Rendering: automatic NVIDIA NVENC GPU encoding with CPU fallback.
-"""
-import argparse, csv, os, re, shutil, signal, statistics, subprocess, sys, threading, time
+"""liveclip: Goated AI Live & VOD Clipper (Groq Multi-Key 6k TPM + Side-by-Side GPU Render)."""
+import argparse, csv, json, os, queue, re, shutil, signal, statistics, subprocess, sys, threading, time, urllib.error, urllib.request
 from collections import Counter, deque
 
 ap = argparse.ArgumentParser(description="AI-powered live stream & VOD vertical clipper.")
@@ -21,19 +13,18 @@ ap.add_argument("--spike", type=float, default=3.0, help="live chat spike multip
 ap.add_argument("--min-rate", type=float, default=1.5, help="minimum live chat msg/s for a spike")
 ap.add_argument("--cooldown", type=float, default=60, help="minimum seconds between live clips")
 ap.add_argument("--warmup", type=float, default=60, help="seconds of chat to learn baseline")
-ap.add_argument("--max-clips", type=int, default=0, help="stop after this many clips (0 = no limit)")
+ap.add_argument("--max-clips", type=int, default=5, help="max clips to generate (0 = no limit)")
 ap.add_argument("--duration", type=float, default=0, help="stop live watching after this many seconds")
-ap.add_argument("--captions", choices=["hinglish", "english", "en", "hi", "auto", "off"], default="hinglish",
-                help="caption language mode (default: hinglish)")
-ap.add_argument("--model", default="auto", help="Whisper model: auto (large-v3-turbo on GPU, small on CPU), medium, large-v3-turbo")
-ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="compute device")
-ap.add_argument("--layout", choices=["blur", "crop"], default="blur", help="9:16 layout when no facecam")
-ap.add_argument("--face", choices=["auto", "top-left", "top-right", "bottom-left", "bottom-right", "none"], default="none",
-                help="facecam position")
-ap.add_argument("--face-pct", type=float, default=35, help="facecam height percentage (default: 35)")
-ap.add_argument("--mode", choices=["auto", "live", "recorded"], default="auto", help="live, recorded, or auto")
+ap.add_argument("--captions", choices=["hinglish", "english", "en", "hi", "auto", "off"], default="hinglish")
+ap.add_argument("--model", default="auto", help="Whisper model: auto, small, medium, large-v3-turbo")
+ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+ap.add_argument("--layout", choices=["blur", "crop"], default="blur")
+ap.add_argument("--face", choices=["auto", "top-left", "top-right", "bottom-left", "bottom-right", "none"], default="none")
+ap.add_argument("--face-pct", type=float, default=35)
+ap.add_argument("--mode", choices=["auto", "live", "recorded"], default="auto")
 ap.add_argument("--font", default="", help="path to a .ttf font for captions")
-ap.add_argument("--no-ai-vod", action="store_true", help="disable AI transcript scoring on VODs (use loudness only)")
+ap.add_argument("--groq-keys", default="", help="comma-separated Groq API keys for multi-key 6k TPM rotation")
+ap.add_argument("--groq-model", default="llama-3.3-70b-versatile", help="Groq LLM model ID")
 ap.add_argument("--keep", action="store_true", help="keep raw recording segments")
 a = ap.parse_args()
 
@@ -100,8 +91,104 @@ def get_device():
         return "cpu"
 
 
-# ------------------------------------------------------------------ 1. Live Record (streamlink -> 6s .ts)
+# ------------------------------------------------------------------ Groq Multi-Key 6k TPM Pool
+class GroqPool:
+    """Manages multiple Groq API keys with a strict 6,000 tokens/min rolling cap per key."""
+    def __init__(self, keys, model="llama-3.3-70b-versatile", tpm_limit=6000):
+        self.keys = [k.strip() for k in keys if k.strip()]
+        self.model = model
+        self.tpm_limit = tpm_limit
+        # Per-key rolling usage: list of (timestamp, tokens_used)
+        self.usage = {i: deque() for i in range(len(self.keys))}
+        self.lock = threading.Lock()
+
+    def _prune(self, idx, now):
+        q = self.usage[idx]
+        while q and now - q[0][0] >= 61.0:
+            q.popleft()
+        return sum(tok for _, tok in q)
+
+    def _acquire_key(self, est_tokens):
+        while True:
+            with self.lock:
+                now = time.time()
+                best_idx, best_used = None, 10**9
+                for i in range(len(self.keys)):
+                    used = self._prune(i, now)
+                    if used + est_tokens <= self.tpm_limit and used < best_used:
+                        best_idx, best_used = i, used
+                if best_idx is not None:
+                    self.usage[best_idx].append((now, est_tokens))
+                    return best_idx, self.keys[best_idx]
+
+                # All keys are at 6k TPM cap -> sleep until the earliest token window frees up
+                wait_times = []
+                for i in range(len(self.keys)):
+                    if self.usage[i]:
+                        wait_times.append(max(1.0, 61.5 - (now - self.usage[i][0][0])))
+                sleep_s = min(wait_times) if wait_times else 5.0
+            say(f"⏳ Groq 6k TPM cap reached across {len(self.keys)} key(s) — waiting {sleep_s:.1f}s…")
+            time.sleep(sleep_s)
+
+    def analyze_chunk(self, chunk_text, clip_len, max_picks=3):
+        """Sends one ~4.8k-token transcript chunk to Groq and returns viral clip dicts."""
+        sys_prompt = (
+            "You are an elite viral short-form video editor (YouTube Shorts / Reels). "
+            "Given a timestamped stream transcript ([seconds] text), pick the funniest, most intense, "
+            "clutch, or high-energy moments. "
+            f"Each clip should be roughly {int(clip_len)} seconds long. "
+            f"Return ONLY valid JSON: {{\"clips\": [{{\"start\": <int_sec>, \"end\": <int_sec>, \"score\": <1-10>, \"title\": \"<short hook>\"}}]}} "
+            f"Pick up to {max_picks} best moments (score >= 7). If nothing is interesting, return {{\"clips\": []}}."
+        )
+        # Estimate total tokens (input + ~800 output buffer)
+        est_tokens = (len(sys_prompt) + len(chunk_text)) // 4 + 800
+        payload = json.dumps({
+            "model": self.model,
+            "temperature": 0.3,
+            "max_completion_tokens": 800,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": chunk_text},
+            ],
+        }).encode("utf-8")
+
+        for attempt in range(len(self.keys) * 2 + 2):
+            key_idx, api_key = self._acquire_key(est_tokens)
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "liveclip/2.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    content = data["choices"][0]["message"]["content"]
+                    parsed = json.loads(content)
+                    return parsed.get("clips", [])
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    say(f"⚠️ Groq Key #{key_idx + 1} hit 429 rate limit, rotating…")
+                    with self.lock:
+                        self.usage[key_idx].append((time.time(), self.tpm_limit))
+                    time.sleep(2)
+                    continue
+                say(f"⚠️ Groq HTTP {e.code} on Key #{key_idx + 1}: {e.read().decode('utf-8', 'ignore')[:160]}")
+                time.sleep(2)
+            except Exception as e:
+                say(f"⚠️ Groq error on Key #{key_idx + 1}: {e}")
+                time.sleep(2)
+        return []
+
+
+# ------------------------------------------------------------------ 1. Live Record & Chat
 rec_start = None
+chat_times = deque(maxlen=200000)
 
 
 def record():
@@ -119,7 +206,7 @@ def record():
             rec_start = time.time()
             say("recording started")
         if ff.poll() is not None:
-            say("recording stopped (stream ended or went offline)")
+            say("recording stopped")
             STOP.set()
             break
         time.sleep(0.2)
@@ -136,19 +223,11 @@ def record():
 def segments():
     if not os.path.exists(SEGLIST):
         return []
-    out = []
-    for row in csv.reader(open(SEGLIST)):
-        if len(row) >= 3:
-            out.append((os.path.join(REC, row[0]), float(row[1]), float(row[2])))
-    return out
+    return [(os.path.join(REC, r[0]), float(r[1]), float(r[2])) for r in csv.reader(open(SEGLIST)) if len(r) >= 3]
 
 
 def rec_now():
     return 0 if rec_start is None else time.time() - rec_start
-
-
-# ------------------------------------------------------------------ 2. Live Chat
-chat_times = deque(maxlen=200000)
 
 
 def chat():
@@ -186,7 +265,7 @@ def top_words(t0, t1, n=4):
     return " ".join(w for w, _ in words.most_common(n))
 
 
-# ------------------------------------------------------------------ 3. Whisper + Viral .ASS Captions
+# ------------------------------------------------------------------ 2. Whisper + Viral .ASS Captions
 _whisper = None
 _wlock = threading.Lock()
 
@@ -210,16 +289,14 @@ def whisper():
         if _whisper is None:
             from faster_whisper import WhisperModel
             dev = get_device()
-            model_name = a.model
-            if model_name == "auto":
-                model_name = "large-v3-turbo" if dev == "cuda" else "small"
+            model_name = ("large-v3-turbo" if dev == "cuda" else "small") if a.model == "auto" else a.model
             say(f"loading Whisper '{model_name}' on {dev}…")
             try:
                 _whisper = WhisperModel(model_name, device=dev, compute_type="float16" if dev == "cuda" else "int8")
             except Exception as e:
                 if dev == "cpu":
                     raise
-                say(f"GPU Whisper failed ({e}), falling back to CPU")
+                say(f"GPU Whisper failed ({e}), using CPU")
                 _whisper = WhisperModel("small", device="cpu", compute_type="int8")
             say(f"Whisper ready ({model_name} on {dev})")
     return _whisper
@@ -233,7 +310,6 @@ def load_wav(path):
 
 
 def transcribe_words(wav_path):
-    """Returns list of word objects with .word, .start, .end."""
     mode = a.captions
     audio = load_wav(wav_path)
     kw = dict(word_timestamps=True, vad_filter=True, condition_on_previous_text=False, beam_size=5)
@@ -243,7 +319,6 @@ def transcribe_words(wav_path):
         kw.update(task="translate")
     elif mode == "hi":
         kw.update(language="hi")
-
     segs, _ = whisper().transcribe(audio, **kw)
     words = [w for s in segs for w in (s.words or []) if w.word.strip()]
     if mode in ("hinglish", "en") and words and hinglish_share(words) < 0.08:
@@ -255,10 +330,7 @@ def transcribe_words(wav_path):
 
 
 def ass_time(s):
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    sec = int(s % 60)
-    cs = int((s - int(s)) * 100)
+    h, m, sec, cs = int(s // 3600), int((s % 3600) // 60), int(s % 60), int((s - int(s)) * 100)
     return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
 
 
@@ -267,24 +339,20 @@ def ts(s):
 
 
 def resolve_font():
-    """Returns (font_name, fonts_dir) for libass."""
     repo_fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
     if a.font and os.path.exists(a.font):
         return os.path.splitext(os.path.basename(a.font))[0].replace("-", " "), os.path.dirname(os.path.abspath(a.font))
     if os.path.isdir(repo_fonts):
         for f in os.listdir(repo_fonts):
             if f.lower().endswith(".ttf"):
-                return "Montserrat ExtraBold" if "montserrat" in f.lower() else os.path.splitext(f)[0], repo_fonts
+                return ("Montserrat ExtraBold" if "montserrat" in f.lower() else os.path.splitext(f)[0]), repo_fonts
     return "DejaVu Sans", "/usr/share/fonts/truetype/dejavu"
 
 
 def write_viral_ass(words, ass_path, srt_path, cap_mid=None, words_per_chunk=3):
-    """Generates CapCut/Hormozi-style word-highlighted .ass captions + .srt backup."""
     font_name, _ = resolve_font()
-    # ASS colors are &HBBGGRR&
     WHITE, YELLOW, BLACK = "&H00FFFFFF&", "&H0000FFFF&", "&H00000000&"
     margin_v = max(120, 1920 - cap_mid - 45) if cap_mid else 420
-
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -309,19 +377,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     events, srt_lines = [], []
     for idx, chunk in enumerate(chunks, 1):
-        srt_txt = " ".join(x.word.strip() for x in chunk).strip(" ,.")
-        srt_lines.append(f"{idx}\n{ts(chunk[0].start)} --> {ts(chunk[-1].end)}\n{srt_txt}\n")
-
+        srt_lines.append(f"{idx}\n{ts(chunk[0].start)} --> {ts(chunk[-1].end)}\n{' '.join(x.word.strip() for x in chunk).strip(' ,.')}\n")
         for active_i, active_w in enumerate(chunk):
-            st = ass_time(active_w.start)
-            en = ass_time(active_w.end + 0.05)
+            st, en = ass_time(active_w.start), ass_time(active_w.end + 0.05)
             parts = []
             for j, w in enumerate(chunk):
                 clean = w.word.strip().replace("{", "").replace("}", "").upper()
-                if j == active_i:
-                    parts.append(f"{{\\c{YELLOW}\\fscx112\\fscy112}}{clean}{{\\c{WHITE}\\fscx100\\fscy100}}")
-                else:
-                    parts.append(clean)
+                parts.append(f"{{\\c{YELLOW}\\fscx112\\fscy112}}{clean}{{\\c{WHITE}\\fscx100\\fscy100}}" if j == active_i else clean)
             pop = "{\\t(0,65,\\fscx108\\fscy108)\\t(65,130,\\fscx100\\fscy100)}" if active_i == 0 else ""
             events.append(f"Dialogue: 0,{st},{en},Viral,,0,0,0,,{pop}{' '.join(parts)}")
 
@@ -332,7 +394,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write("\n".join(srt_lines))
 
 
-# ------------------------------------------------------------------ 4. Facecam Detection & GPU Render
+# ------------------------------------------------------------------ 3. Facecam & GPU Render
 FACE = None
 CORNERS = {"top-left": (0, 0), "top-right": (1, 0), "bottom-left": (0, 1), "bottom-right": (1, 1)}
 
@@ -360,7 +422,6 @@ def detect_face(raw, dur, w, h):
         import cv2, numpy as np
         cv2.CascadeClassifier
     except (ImportError, AttributeError):
-        say("facecam: needs OpenCV 4, using whole frame")
         return None
     hc = cv2.data.haarcascades
     front = cv2.CascadeClassifier(os.path.join(hc, "haarcascade_frontalface_alt2.xml"))
@@ -387,16 +448,13 @@ def detect_face(raw, dur, w, h):
             best, best_frames = group, frames
     if best_frames < 3:
         return None
-    cx = sum(q[1] for q in best) / len(best)
-    cy = sum(q[2] for q in best) / len(best)
+    cx, cy = sum(q[1] for q in best) / len(best), sum(q[2] for q in best) / len(best)
     size = sorted(q[3] for q in best)[len(best) // 2]
     if 0.3 < cx < 0.7 and 0.3 < cy < 0.7 and size > 0.12:
         return None
     fw = min(0.45, max(0.18, size * 2.4))
     fh = fw * w / face_aspect() / h
-    cx = min(1 - fw / 2, max(fw / 2, cx))
-    cy = min(1 - fh / 2, max(fh / 2, cy))
-    return (cx, cy, fw, fh)
+    return (min(1 - fw / 2, max(fw / 2, cx)), min(1 - fh / 2, max(fh / 2, cy)), fw, fh)
 
 
 def face_box(raw, dur):
@@ -421,31 +479,7 @@ def face_box(raw, dur):
 _cut_lock = threading.Lock()
 
 
-def cut(t0, t1, name):
-    with _cut_lock:
-        deadline = time.time() + 60
-        while not any(e >= t1 for _, _, e in segments()):
-            if STOP.is_set():
-                break
-            if time.time() > deadline:
-                say("not enough recording for", name)
-                return None
-            time.sleep(1)
-        segs = [s for s in segments() if s[2] > t0 and s[1] < t1]
-        if not segs:
-            return None
-        t1 = min(t1, segs[-1][2])
-        tmp = os.path.join(REC, name)
-        os.makedirs(tmp, exist_ok=True)
-        lst = os.path.join(tmp, "list.txt")
-        open(lst, "w").write("".join(f"file '{f}'\n" for f, _, _ in segs))
-        raw = os.path.join(tmp, "raw.ts")
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", raw], check=True)
-        return render(raw, max(0, t0 - segs[0][1]), t1 - t0, name, tmp)
-
-
 def render(raw, ss, dur, name, tmp):
-    """Renders 9:16 vertical clip with viral .ass captions using GPU NVENC when available."""
     fb = face_box(raw, dur) if a.face != "none" else None
     if fb:
         x, y, bw, bh = fb
@@ -467,8 +501,7 @@ def render(raw, ss, dur, name, tmp):
         subprocess.run(["ffmpeg", "-v", "fatal", "-y", "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-i", raw,
                         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
         try:
-            with step("generating viral word-level captions"):
-                words = transcribe_words(wav)
+            words = transcribe_words(wav)
             if words:
                 ass_path = os.path.join(tmp, "caps.ass")
                 srt_path = os.path.join(OUT, name + ".srt")
@@ -485,17 +518,16 @@ def render(raw, ss, dur, name, tmp):
     vcodec = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"] if has_nvenc() else [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"
     ]
-    with step(f"rendering vertical clip ({'GPU NVENC' if has_nvenc() else 'CPU'})"):
-        subprocess.run([
-            "ffmpeg", "-v", "fatal", "-y", "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-i", raw,
-            "-filter_complex", vf, "-map", f"[{last}]", "-map", "0:a:0?",
-            *vcodec, "-r", "30", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out
-        ], check=True)
+    subprocess.run([
+        "ffmpeg", "-v", "fatal", "-y", "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-i", raw,
+        "-filter_complex", vf, "-map", f"[{last}]", "-map", "0:a:0?",
+        *vcodec, "-r", "30", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out
+    ], check=True)
     shutil.rmtree(tmp, ignore_errors=True)
     return out
 
 
-# ------------------------------------------------------------------ 5. Recorded VODs (AI Transcript + Audio Scoring)
+# ------------------------------------------------------------------ 4. Recorded VOD (Groq Multi-Key + Side-by-Side Render)
 YTDLP = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-playlist"]
 CLIENTS = [[], *[["--extractor-args", f"youtube:player_client={c}"] for c in ("tv_simply", "tv", "web_safari", "mweb", "android_vr")]]
 CLIENT = []
@@ -532,109 +564,41 @@ def is_live(url):
         r = subprocess.run([*YTDLP, *c, "--skip-download", "--print", "%(is_live)s", url], capture_output=True, text=True)
         if r.returncode == 0 or not is_bot_block(r.stderr):
             break
-        say("YouTube bot check triggered, switching client…")
     else:
         raise SystemExit(BLOCKED)
     CLIENT = c
     if r.returncode:
-        err = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
-        raise SystemExit(f"Couldn't open link: {err}")
+        raise SystemExit(f"Couldn't open link: {(r.stderr.strip().splitlines() or ['error'])[-1]}")
     return r.stdout.strip().splitlines()[-1:] == ["True"]
 
 
-def audio_energy_curve(wav_16k):
-    """Returns per-second normalized loudness score (0.0 to 1.0)."""
-    import numpy as np
-    x = load_wav(wav_16k)
-    sec = len(x) // 16000
-    if sec < 2:
-        return np.zeros(1)
-    rms = np.sqrt((x[:sec * 16000].reshape(sec, 16000) ** 2).mean(1)) + 1e-6
-    db = 20 * np.log10(rms)
-    med = np.median(db)
-    norm = np.clip((db - med) / 15.0, 0.0, 1.0)
-    return norm
-
-
-def ai_vod_moments(wav_16k, n, length):
-    """Transcribes VOD on GPU and scores 30s windows with AI emotion + pacing + keywords + loudness."""
-    import numpy as np
-    energy = audio_energy_curve(wav_16k)
-    total_sec = len(energy)
-    if total_sec <= length:
-        return [(0.0, 10.0, "full video")]
-
-    with step("transcribing VOD audio on GPU for AI highlight analysis"):
-        audio = load_wav(wav_16k)
-        segs, _ = whisper().transcribe(audio, vad_filter=True, beam_size=1, condition_on_previous_text=False)
-        transcript = [(s.start, s.end, s.text.strip()) for s in segs if s.text.strip()]
-
-    if not transcript:
-        say("no speech detected, falling back to audio peaks")
-        return [(float(i), 5.0, "loud peak") for i in np.argsort(energy)[::-1][:n]]
-
-    # Load lightweight local emotion AI on GPU
-    clf = None
-    try:
-        from transformers import pipeline
-        dev_id = 0 if get_device() == "cuda" else -1
-        with step("loading AI emotion/hype analyzer"):
-            clf = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base",
-                           top_k=None, device=dev_id, truncation=True)
-    except Exception as e:
-        say(f"transformers AI model unavailable ({e}), using keywords + pacing + audio")
-
-    hype_re = re.compile(r"\b(no way|what|bro|bhai|insane|clutch|let'?s go|omg|wtf|crazy|clip|dead|lmao|arre|abe|mast|op)\b", re.I)
-
-    # Build sliding windows every 10 seconds
-    windows = []
-    step_s = 10
-    for start in range(0, max(1, total_sec - int(length)), step_s):
-        end = start + length
-        txt = " ".join(t for s, e, t in transcript if e > start and s < end).strip()
-        if len(txt.split()) < 6:
-            continue
-        windows.append((start, txt))
-
-    # Batch-score texts with AI emotion model on GPU (very fast)
-    ai_scores = [0.5] * len(windows)
-    ai_labels = ["hype"] * len(windows)
-    if clf and windows:
-        with step(f"AI-scoring {len(windows)} candidate moments"):
-            texts = [w[1][:512] for w in windows]
-            preds = clf(texts, batch_size=32)
-            for idx, p in enumerate(preds):
-                em = {d["label"]: d["score"] for d in p}
-                ai_scores[idx] = min(1.0, em.get("surprise", 0) + em.get("joy", 0) + em.get("anger", 0) * 0.8)
-                ai_labels[idx] = max(em, key=em.get)
-
-    scored = []
-    for idx, (start, txt) in enumerate(windows):
-        wps = len(txt.split()) / max(length, 1.0)
-        pacing = min(wps / 3.5, 1.0)
-        kw = min(len(hype_re.findall(txt)) * 0.25, 1.0)
-        aud = float(np.max(energy[start:min(total_sec, int(start + length))]))
-        total = (ai_scores[idx] * 4.5) + (pacing * 2.0) + (kw * 1.5) + (aud * 2.0)
-        preview = txt[:55].replace("\n", " ") + "…"
-        scored.append((total, float(start), f"{ai_labels[idx]} | {preview}"))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    picks = []
-    for score, start, reason in scored:
-        if all(abs(start - p[0]) >= length for p in picks):
-            picks.append((start, round(score, 2), reason))
-        if len(picks) >= n:
-            break
-    return sorted(picks, key=lambda x: x[0])
+def chunk_transcript(lines, max_input_tokens=4800):
+    """Packs '[sec] text' lines into ~4.8k-token chunks so total (in+out) stays under 6k TPM."""
+    chunks, cur, cur_tok = [], [], 0
+    for ln in lines:
+        tok = len(ln) // 4 + 2
+        if cur and cur_tok + tok > max_input_tokens:
+            chunks.append("\n".join(cur))
+            cur, cur_tok = [], 0
+        cur.append(ln)
+        cur_tok += tok
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
 
 
 def recorded():
-    n = a.max_clips or 5
+    max_clips = a.max_clips or 5
     length = a.pre + a.post
     work = os.path.join(REC, "vod")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
-    say("recorded VOD mode: analyzing transcript & audio with AI")
+
+    keys = [k.strip() for k in a.groq_keys.split(",") if k.strip()]
+    if not keys:
+        sys.exit("❌ Pass at least one Groq API key via --groq-keys.")
+
+    say(f"🚀 VOD AI Mode: {len(keys)} Groq key(s) (6k TPM/key) + Side-by-Side GPU Rendering")
     audio = os.path.join(work, "audio.%(ext)s")
     with step("downloading VOD audio"):
         ytdlp(["-f", "ba/b[height<=480]/b", "-o", audio, a.url], "audio")
@@ -646,35 +610,78 @@ def recorded():
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(work, got[0]),
                         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
 
-    picks = ai_vod_moments(wav, n, length)
-    say(f"AI selected {len(picks)} top moment(s):")
-    for idx, (t0, sc, reason) in enumerate(picks, 1):
-        say(f"  #{idx} at {int(t0 // 60)}:{int(t0 % 60):02d} (score {sc}/10) -> {reason}")
+    with step("transcribing VOD on GPU"):
+        segs, _ = whisper().transcribe(load_wav(wav), vad_filter=True, beam_size=1, condition_on_previous_text=False)
+        lines = [f"[{int(s.start)}s] {s.text.strip()}" for s in segs if s.text.strip()]
 
-    made = 0
-    for k, (t0, sc, reason) in enumerate(picks):
-        name = f"clip_{time.strftime('%Y%m%d_%H%M%S')}_{int(t0 // 60)}m{int(t0 % 60):02d}s"
-        tmp = os.path.join(work, name)
-        os.makedirs(tmp)
-        raw = os.path.join(tmp, "raw.mp4")
-        say(f"clip {k + 1}/{len(picks)}: {int(t0 // 60)}:{int(t0 % 60):02d}")
-        try:
-            with step(f"downloading clip {k + 1} video"):
+    chunks = chunk_transcript(lines, max_input_tokens=4800)
+    say(f"📝 Transcript ready: {len(lines)} lines split into {len(chunks)} Groq chunk(s) (~4.8k tokens each)")
+
+    # Side-by-Side Pipeline: Consumer renders clips as soon as Producer (Groq) finds them
+    clip_q = queue.Queue()
+    made_count = [0]
+    seen_starts = []
+
+    def render_worker():
+        while True:
+            item = clip_q.get()
+            if item is None:
+                clip_q.task_done()
+                break
+            t0, dur, score, title = item
+            if made_count[0] >= max_clips:
+                clip_q.task_done()
+                continue
+            safe_title = re.sub(r"[^a-zA-Z0-9]+", "_", title).strip("_")[:28]
+            name = f"clip_{int(t0 // 60)}m{int(t0 % 60):02d}s_{safe_title}"
+            tmp = os.path.join(work, name)
+            os.makedirs(tmp, exist_ok=True)
+            raw = os.path.join(tmp, "raw.mp4")
+            say(f"🎬 [Worker] Rendering '{title}' ({int(t0 // 60)}:{int(t0 % 60):02d}, score {score}/10)…")
+            try:
                 ytdlp(["-f", "bv*[height<=720]+ba/b[height<=720]/b", "--merge-output-format", "mp4",
-                       "--download-sections", f"*{t0:.0f}-{t0 + length:.0f}", "--force-keyframes-at-cuts",
-                       "-o", raw, a.url], "clip video")
-            path = render(raw, 0, length, name, tmp)
-        except Exception as e:
-            say(f"clip {k + 1} failed ({e}), skipping")
-            continue
-        made += 1
-        say("saved", path)
+                       "--download-sections", f"*{t0:.0f}-{t0 + dur:.0f}", "--force-keyframes-at-cuts",
+                       "-o", raw, a.url], "clip")
+                path = render(raw, 0, dur, name, tmp)
+                made_count[0] += 1
+                say("saved", path)
+            except Exception as e:
+                say(f"⚠️ [Worker] Failed '{title}': {e}")
+            clip_q.task_done()
+
+    worker = threading.Thread(target=render_worker, daemon=True)
+    worker.start()
+
+    pool = GroqPool(keys, model=a.groq_model, tpm_limit=6000)
+    queued_total = 0
+
+    for idx, ch in enumerate(chunks, 1):
+        if queued_total >= max_clips or QUIT.is_set():
+            break
+        say(f"🤖 [Groq] Analyzing chunk {idx}/{len(chunks)}…")
+        picks = pool.analyze_chunk(ch, clip_len=length, max_picks=max(1, max_clips - queued_total))
+        picks.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
+        for p in picks:
+            if queued_total >= max_clips:
+                break
+            t0 = max(0.0, float(p.get("start", 0)))
+            t1 = float(p.get("end", t0 + length))
+            dur = max(15.0, min(60.0, t1 - t0)) if t1 > t0 else length
+            if any(abs(t0 - s) < length * 0.7 for s in seen_starts):
+                continue
+            seen_starts.append(t0)
+            queued_total += 1
+            clip_q.put((t0, dur, p.get("score", 8), p.get("title", "highlight")))
+            say(f"✨ [Groq] Queued #{queued_total}: '{p.get('title', 'highlight')}' at {int(t0 // 60)}:{int(t0 % 60):02d}")
+
+    clip_q.put(None)
+    worker.join()
     if not a.keep:
         shutil.rmtree(REC, ignore_errors=True)
-    say(f"done: {made} clip(s) in {OUT}")
+    say(f"done: {made_count[0]} clip(s) in {OUT}")
 
 
-# ------------------------------------------------------------------ 6. Live Main Loop
+# ------------------------------------------------------------------ 5. Live Main Loop
 def main():
     say(f"liveclip -> {OUT}")
     rec_thread = threading.Thread(target=record, daemon=True)
@@ -690,33 +697,6 @@ def main():
 
     signal.signal(signal.SIGINT, on_ctrl_c)
     t_begin, last_clip, n, jobs = time.time(), -1e9, 0, []
-    last_status = time.time()
-    new = not os.path.exists(LOG)
-    logf = open(LOG, "a", newline="")
-    w = csv.writer(logf)
-    if new:
-        w.writerow(["file", "made_at", "rec_from", "rec_to", "reason", "chat_rate", "normal_rate", "chat_words"])
-
-    def make(t_spike, reason, rate=0.0, base=0.0):
-        nonlocal n
-        n += 1
-        name = time.strftime("clip_%Y%m%d_%H%M%S")
-        t0, t1 = max(0, t_spike - a.pre), t_spike + a.post
-        words = top_words(rec_start + t0, rec_start + t1)
-        say(f"{reason}: clipping {t0:.0f}-{t1:.0f}s (chat {rate:.1f}/s vs {base:.1f}/s: {words})")
-
-        def job():
-            path = cut(t0, t1, name)
-            if path:
-                say("saved", path)
-                w.writerow([os.path.basename(path), time.strftime("%H:%M:%S"), f"{t0:.1f}", f"{t1:.1f}",
-                            reason, f"{rate:.2f}", f"{base:.2f}", words])
-                logf.flush()
-
-        th = threading.Thread(target=job)
-        th.start()
-        jobs.append(th)
-
     while not STOP.is_set() and not QUIT.is_set():
         time.sleep(1)
         if rec_start is None:
@@ -728,15 +708,31 @@ def main():
         hist = sec[:-8][-int(min(152, max(8, now - t_begin - 8))):]
         bins = [sum(hist[i:i + 8]) / 8 for i in range(0, len(hist) - 7, 4)]
         base = max(statistics.median(bins) if bins else 0, 0.2)
-        if now - last_status >= 60:
-            last_status = now
-            m, s_ = divmod(int(rec_now()), 60)
-            say(f"status: {m}:{s_:02d} recorded · chat {rate:.1f}/s · {n} clip(s)")
-        if not warm:
-            continue
-        if rate >= max(a.spike * base, a.min_rate) and rec_now() - last_clip > a.cooldown:
+        if warm and rate >= max(a.spike * base, a.min_rate) and rec_now() - last_clip > a.cooldown:
             last_clip = rec_now()
-            make(rec_now(), "chat spike", rate, base)
+            n += 1
+            name = time.strftime("clip_%Y%m%d_%H%M%S")
+            t0, t1 = max(0, rec_now() - a.pre), rec_now() + a.post
+            say(f"chat spike: clipping {t0:.0f}-{t1:.0f}s")
+
+            def job(t0=t0, t1=t1, name=name):
+                with _cut_lock:
+                    segs = [s for s in segments() if s[2] > t0 and s[1] < t1]
+                    if not segs:
+                        return
+                    tmp = os.path.join(REC, name)
+                    os.makedirs(tmp, exist_ok=True)
+                    lst = os.path.join(tmp, "list.txt")
+                    open(lst, "w").write("".join(f"file '{f}'\n" for f, _, _ in segs))
+                    raw = os.path.join(tmp, "raw.ts")
+                    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", raw], check=True)
+                    path = render(raw, max(0, t0 - segs[0][1]), min(t1, segs[-1][2]) - t0, name, tmp)
+                    if path:
+                        say("saved", path)
+
+            th = threading.Thread(target=job)
+            th.start()
+            jobs.append(th)
         if a.max_clips and n >= a.max_clips:
             break
         if a.duration and now - t_begin > a.duration:
@@ -747,7 +743,6 @@ def main():
         th.join()
     STOP.set()
     rec_thread.join(5)
-    logf.close()
     if not a.keep:
         shutil.rmtree(REC, ignore_errors=True)
     say(f"done: {n} clip(s) in {OUT}")
@@ -757,5 +752,4 @@ if __name__ == "__main__":
     mode = a.mode
     if mode == "auto":
         mode = "live" if is_live(a.url) else "recorded"
-        say("mode: " + ("LIVE stream (chat spikes)" if mode == "live" else "Recorded VOD (AI transcript + audio)"))
     recorded() if mode == "recorded" else main()
