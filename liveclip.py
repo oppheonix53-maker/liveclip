@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""liveclip: Goated AI Live & VOD Clipper (Groq Multi-Key 6k TPM + Side-by-Side GPU Render)."""
+"""liveclip: Goated AI Live & VOD Clipper (Audio Loudness + Groq Multi-Key 6k TPM + Side-by-Side GPU Render)."""
 import argparse, csv, json, os, queue, re, shutil, signal, statistics, subprocess, sys, threading, time, urllib.error, urllib.request
 from collections import Counter, deque
 
@@ -98,7 +98,6 @@ class GroqPool:
         self.keys = [k.strip() for k in keys if k.strip()]
         self.model = model
         self.tpm_limit = tpm_limit
-        # Per-key rolling usage: list of (timestamp, tokens_used)
         self.usage = {i: deque() for i in range(len(self.keys))}
         self.lock = threading.Lock()
 
@@ -121,7 +120,6 @@ class GroqPool:
                     self.usage[best_idx].append((now, est_tokens))
                     return best_idx, self.keys[best_idx]
 
-                # All keys are at 6k TPM cap -> sleep until the earliest token window frees up
                 wait_times = []
                 for i in range(len(self.keys)):
                     if self.usage[i]:
@@ -136,11 +134,12 @@ class GroqPool:
             "You are an elite viral short-form video editor (YouTube Shorts / Reels). "
             "Given a timestamped stream transcript ([seconds] text), pick the funniest, most intense, "
             "clutch, or high-energy moments. "
+            "Lines tagged [LOUD] or [VERY LOUD] indicate audio loudness spikes (screaming, shouting, hype reactions)—"
+            "heavily prioritize moments where high audio energy matches funny or intense dialogue. "
             f"Each clip should be roughly {int(clip_len)} seconds long. "
             f"Return ONLY valid JSON: {{\"clips\": [{{\"start\": <int_sec>, \"end\": <int_sec>, \"score\": <1-10>, \"title\": \"<short hook>\"}}]}} "
             f"Pick up to {max_picks} best moments (score >= 7). If nothing is interesting, return {{\"clips\": []}}."
         )
-        # Estimate total tokens (input + ~800 output buffer)
         est_tokens = (len(sys_prompt) + len(chunk_text)) // 4 + 800
         payload = json.dumps({
             "model": self.model,
@@ -153,7 +152,7 @@ class GroqPool:
             ],
         }).encode("utf-8")
 
-        for attempt in range(len(self.keys) * 2 + 2):
+        for _ in range(len(self.keys) * 2 + 2):
             key_idx, api_key = self._acquire_key(est_tokens)
             req = urllib.request.Request(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -527,7 +526,7 @@ def render(raw, ss, dur, name, tmp):
     return out
 
 
-# ------------------------------------------------------------------ 4. Recorded VOD (Groq Multi-Key + Side-by-Side Render)
+# ------------------------------------------------------------------ 4. Recorded VOD (Audio Loudness + Groq AI + Side-by-Side Render)
 YTDLP = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-playlist"]
 CLIENTS = [[], *[["--extractor-args", f"youtube:player_client={c}"] for c in ("tv_simply", "tv", "web_safari", "mweb", "android_vr")]]
 CLIENT = []
@@ -572,6 +571,18 @@ def is_live(url):
     return r.stdout.strip().splitlines()[-1:] == ["True"]
 
 
+def audio_db_curve(wav_16k):
+    """Returns per-second dB above median loudness."""
+    import numpy as np
+    x = load_wav(wav_16k)
+    sec = len(x) // 16000
+    if sec < 2:
+        return np.zeros(1)
+    rms = np.sqrt((x[:sec * 16000].reshape(sec, 16000) ** 2).mean(1)) + 1e-6
+    db = 20 * np.log10(rms)
+    return db - np.median(db)
+
+
 def chunk_transcript(lines, max_input_tokens=4800):
     """Packs '[sec] text' lines into ~4.8k-token chunks so total (in+out) stays under 6k TPM."""
     chunks, cur, cur_tok = [], [], 0
@@ -588,6 +599,7 @@ def chunk_transcript(lines, max_input_tokens=4800):
 
 
 def recorded():
+    import numpy as np
     max_clips = a.max_clips or 5
     length = a.pre + a.post
     work = os.path.join(REC, "vod")
@@ -598,7 +610,7 @@ def recorded():
     if not keys:
         sys.exit("❌ Pass at least one Groq API key via --groq-keys.")
 
-    say(f"🚀 VOD AI Mode: {len(keys)} Groq key(s) (6k TPM/key) + Side-by-Side GPU Rendering")
+    say(f"🚀 VOD Hybrid AI Mode: Audio Loudness + {len(keys)} Groq key(s) (6k TPM/key) + Side-by-Side GPU Render")
     audio = os.path.join(work, "audio.%(ext)s")
     with step("downloading VOD audio"):
         ytdlp(["-f", "ba/b[height<=480]/b", "-o", audio, a.url], "audio")
@@ -610,14 +622,34 @@ def recorded():
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", os.path.join(work, got[0]),
                         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav], check=True)
 
-    with step("transcribing VOD on GPU"):
+    with step("analyzing audio loudness & transcribing VOD on GPU"):
+        db_curve = audio_db_curve(wav)
         segs, _ = whisper().transcribe(load_wav(wav), vad_filter=True, beam_size=1, condition_on_previous_text=False)
-        lines = [f"[{int(s.start)}s] {s.text.strip()}" for s in segs if s.text.strip()]
+        lines = []
+        covered_secs = set()
+        for s in segs:
+            txt = s.text.strip()
+            if not txt:
+                continue
+            i0, i1 = max(0, int(s.start)), min(len(db_curve), int(s.end) + 1)
+            peak_db = float(np.max(db_curve[i0:i1])) if i1 > i0 else 0.0
+            tag = "[VERY LOUD] " if peak_db >= 10.0 else ("[LOUD] " if peak_db >= 6.0 else "")
+            lines.append(f"[{int(s.start)}s] {tag}{txt}")
+            covered_secs.update(range(i0, i1))
+
+        # Catch pure non-verbal screams / hype bursts skipped by Whisper VAD
+        loud_peaks = [i for i in range(len(db_curve)) if db_curve[i] >= 12.0 and i not in covered_secs]
+        last_p = -999
+        for p in loud_peaks:
+            if p - last_p >= 15:
+                lines.append(f"[{p}s] [VERY LOUD REACTION / SCREAM]")
+                last_p = p
+        lines.sort(key=lambda x: int(re.match(r"\[(\d+)s\]", x).group(1)))
 
     chunks = chunk_transcript(lines, max_input_tokens=4800)
-    say(f"📝 Transcript ready: {len(lines)} lines split into {len(chunks)} Groq chunk(s) (~4.8k tokens each)")
+    say(f"📝 Hybrid transcript ready: {len(lines)} lines -> {len(chunks)} Groq chunk(s) (~4.8k tokens each)")
 
-    # Side-by-Side Pipeline: Consumer renders clips as soon as Producer (Groq) finds them
+    # Side-by-Side Pipeline: GPU Render Worker runs while Groq analyzes remaining chunks
     clip_q = queue.Queue()
     made_count = [0]
     seen_starts = []
